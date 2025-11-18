@@ -1,13 +1,12 @@
 """Whatsapper platform for notify component."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 
 import voluptuous as vol
-
-import requests
 
 from homeassistant.components.notify import (
     PLATFORM_SCHEMA,
@@ -19,6 +18,7 @@ from homeassistant.components.notify import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class ChatListParser(HTMLParser):
     
     Parses format: "Chat Name: chat_id@domain"
     Example: "Purple Tentacle: 31612345678@c.us"
+         and "Take Over the World Taskforce: 31612345678-0987654321@g.us"
     Handles chat names containing colons.
     """
 
@@ -72,7 +73,7 @@ class ChatListParser(HTMLParser):
             
             # Validate chat_id format (should contain @ symbol)
             if chat_id and "@" in chat_id and chat_name:
-                self.chats[chat_id] = chat_name
+                self.chats[chat_name] = chat_id
                 _LOGGER.debug("Parsed chat: '%s' -> %s", chat_name, chat_id)
         else:
             _LOGGER.debug("Skipping invalid chat format: %s", content)
@@ -109,6 +110,7 @@ class WhatsapperNotificationService(BaseNotificationService):
         self.hass = hass
         self._cached_targets = None
         self._cache_timestamp = None
+        #async io.createself.targets()
 
     @property
     def targets(self):
@@ -116,6 +118,9 @@ class WhatsapperNotificationService(BaseNotificationService):
         
         This property is called by Home Assistant to discover available
         notification targets. Returns a dict mapping chat_id -> chat_name.
+        
+        Note: This must be synchronous, so we return cached data or trigger
+        an async fetch in the background if cache is stale.
         """
         now = datetime.now()
         
@@ -127,47 +132,42 @@ class WhatsapperNotificationService(BaseNotificationService):
         ):
             return self._cached_targets
 
-        # Fetch and parse chat list
+        # If cache is stale or missing, trigger background refresh
+        # and return current cache (or empty dict)
+        asyncio.create_task(self._async_refresh_targets())
+        
+        return self._cached_targets or {}
+
+    async def _async_refresh_targets(self):
+        """Fetch and parse chat list asynchronously."""
         try:
+            session = async_get_clientsession(self.hass)
             url = f'http://{self.host_port}/chats'
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
             
-            # Parse HTML to extract chat list
+            async with session.get(url, timeout=10) as response:
+                response.raise_for_status()
+                html_content = await response.text()
+            
+            # Parse HTML to extract chat list (parsing is CPU-bound but fast)
             parser = ChatListParser()
-            parser.feed(response.text)
+            parser.feed(html_content)
             
             self._cached_targets = parser.chats
-            self._cache_timestamp = now
+            self._cache_timestamp = datetime.now()
             
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Fetched %d chat targets from %s",
                 len(self._cached_targets),
                 url
             )
-            
-            return self._cached_targets
 
-        except requests.RequestException as e:
-            _LOGGER.error("Failed to fetch chat list from %s: %s", url, e)
-            # Return cached targets if available, even if expired
-            if self._cached_targets is not None:
-                _LOGGER.warning("Using expired cache due to fetch failure")
-                return self._cached_targets
-            # Return empty dict if no cache available
-            return {}
+        except asyncio.TimeoutError:
+            _LOGGER.error("Timeout fetching chat list from %s", url)
         except Exception as e:
-            _LOGGER.error("Error parsing chat list: %s", e)
-            return self._cached_targets or {}
+            _LOGGER.error("Failed to fetch chat list: %s", e)
 
-    def refresh_targets(self):
-        """Force refresh of chat targets by invalidating cache."""
-        self._cache_timestamp = None
-        self._cached_targets = None
-        _LOGGER.info("Chat targets cache invalidated")
-
-    def send_message(self, message="", **kwargs):
-        """Send a message to the target."""
+    async def async_send_message(self, message="", **kwargs):
+        """Send a message to the target asynchronously."""
         try:
             # Use override from notify or the one in the config
             chat_id = kwargs.get(ATTR_TARGET)
@@ -180,8 +180,13 @@ class WhatsapperNotificationService(BaseNotificationService):
                     _LOGGER.error("Empty target list provided")
                     return
                 chat_id = chat_id[0]
+            await self._async_refresh_targets()
+            tt = self._cached_targets
+            if chat_id in tt:
+                chat_id = tt[chat_id]
             
             data = kwargs.get(ATTR_DATA)
+            session = async_get_clientsession(self.hass)
 
             # Send image if all required image data is present
             if data and all(attr in data for attr in [ATTR_IMAGE, ATTR_IMAGE_TYPE, ATTR_IMAGE_NAME]):
@@ -194,8 +199,8 @@ class WhatsapperNotificationService(BaseNotificationService):
                         data[ATTR_IMAGE_NAME]
                     ]
                 }
-                response = requests.post(url, json=body, timeout=30)
-                response.raise_for_status()
+                async with session.post(url, json=body, timeout=30) as response:
+                    response.raise_for_status()
                 _LOGGER.debug("Sent media message to %s", chat_id)
                 return
 
@@ -206,11 +211,16 @@ class WhatsapperNotificationService(BaseNotificationService):
             
             url = f'http://{self.host_port}/command'
             body = {"command": "sendMessage", "params": [chat_id, msg]}
-            response = requests.post(url, json=body, timeout=30)
-            response.raise_for_status()
+            async with session.post(url, json=body, timeout=30) as response:
+                response.raise_for_status()
             _LOGGER.debug("Sent text message to %s", chat_id)
 
-        except requests.RequestException as e:
-            _LOGGER.error("HTTP request to %s failed: %s", chat_id, e)
+        except asyncio.TimeoutError:
+            _LOGGER.error("Timeout sending message to %s", chat_id)
         except Exception as e:
             _LOGGER.error("Sending to %s failed: %s", chat_id, e)
+
+    def send_message(self, message="", **kwargs):
+        """Send a message to the target (sync wrapper)."""
+        # Run the async function in the event loop
+        asyncio.create_task(self.async_send_message(message, **kwargs))
