@@ -110,14 +110,12 @@ class WhatsapperNotificationService(BaseNotificationService):
         self.hass = hass
         self._cached_targets = None
         self._cache_timestamp = None
-        #async io.createself.targets()
-
     @property
     def targets(self):
         """Return a dictionary of registered chat targets.
         
         This property is called by Home Assistant to discover available
-        notification targets. Returns a dict mapping chat_id -> chat_name.
+        notification targets. Returns a dict mapping chat_name -> chat_id.
         
         Note: This must be synchronous, so we return cached data or trigger
         an async fetch in the background if cache is stale.
@@ -134,7 +132,7 @@ class WhatsapperNotificationService(BaseNotificationService):
 
         # If cache is stale or missing, trigger background refresh
         # and return current cache (or empty dict)
-        asyncio.create_task(self._async_refresh_targets())
+        self.hass.async_create_task(self._async_refresh_targets())
         
         return self._cached_targets or {}
 
