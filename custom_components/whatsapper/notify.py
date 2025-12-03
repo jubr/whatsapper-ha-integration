@@ -179,9 +179,8 @@ class WhatsapperNotificationService(BaseNotificationService):
                     return
                 chat_id = chat_id[0]
             await self._async_refresh_targets()
-            tt = self._cached_targets
-            if chat_id in tt:
-                chat_id = tt[chat_id]
+            if chat_id in self._cached_targets:
+                chat_id = self._cached_targets[chat_id]
             
             data = kwargs.get(ATTR_DATA)
             session = async_get_clientsession(self.hass)
@@ -220,5 +219,5 @@ class WhatsapperNotificationService(BaseNotificationService):
 
     def send_message(self, message="", **kwargs):
         """Send a message to the target (sync wrapper)."""
-        # Run the async function in the event loop
-        asyncio.create_task(self.async_send_message(message, **kwargs))
+        # Run the async function in the Home Assistant event loop
+        self.hass.async_create_task(self.async_send_message(message, **kwargs))
